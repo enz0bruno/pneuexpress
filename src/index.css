@@ -1,0 +1,20 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "DM Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-display: "Bebas Neue", sans-serif;
+  
+  --color-ac: #f5c800;
+  --color-ac2: #e5ba00;
+  --color-dark: #f5f5f5;
+  --color-card: #ffffff;
+  --color-border: #e2e2e2;
+}
+
+@layer base {
+  body {
+    @apply bg-white text-[#1a1a1a] antialiased;
+  }
+}
+
+@import url('https://fonts.googleapis.com/css2?family=Bebas+Neue&family=DM+Sans:wght@300;400;600&display=swap');
