@@ -3,15 +3,42 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
-import { ShoppingCart, X, Plus, Minus, Trash2, Mail, MapPin, Clock, Search, CheckCircle2, Truck, RefreshCw, Trophy, CreditCard, ShieldCheck, ArrowLeftRight, Fuel, Droplets, Volume2, Smartphone } from 'lucide-react';
+import { ShoppingCart, X, Plus, Minus, Trash2, Mail, MapPin, Clock, Search, CheckCircle2, Truck, RefreshCw, Trophy, CreditCard, ShieldCheck, ArrowLeftRight, Fuel, Droplets, Volume2, Smartphone, AlertCircle } from 'lucide-react';
 import { PRODUCTS, CARS, BRANDS, Product, TIRE_IMAGE, FEATURED_TIRE } from './data';
+import { loadStripe } from '@stripe/stripe-js';
+
+// Initialize Stripe
+const stripePromise = import.meta.env.VITE_STRIPE_PUBLISHABLE_KEY 
+  ? loadStripe(import.meta.env.VITE_STRIPE_PUBLISHABLE_KEY) 
+  : null;
 
 interface CartItem extends Product {
   cartId: number;
   qty: number;
 }
+
+const SHIPPING_COST = 12.99;
+
+const getGradeColor = (grade: string) => {
+  const colors: Record<string, string> = {
+    'A': 'text-green-600',
+    'B': 'text-lime-500',
+    'C': 'text-yellow-500',
+    'D': 'text-orange-500',
+    'E': 'text-red-500',
+    'F': 'text-red-700',
+    'G': 'text-gray-900'
+  };
+  return colors[grade] || 'text-black';
+};
+
+const getNoiseColor = (noise: number) => {
+  if (noise <= 69) return 'text-green-600';
+  if (noise <= 71) return 'text-yellow-500';
+  return 'text-orange-500';
+};
 
 export default function App() {
   const [cart, setCart] = useState<CartItem[]>([]);
@@ -20,6 +47,15 @@ export default function App() {
   const [compareList, setCompareList] = useState<Product[]>([]);
   const [isCheckoutOpen, setIsCheckoutOpen] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
+  const [view, setView] = useState<'shop' | 'tracking'>('shop');
+  const [order, setOrder] = useState<{id: string, items: CartItem[], total: number, date: Date, status: string} | null>(null);
+  const [isVerifyingPayment, setIsVerifyingPayment] = useState(false);
+  const [isGeneratingQR, setIsGeneratingQR] = useState(false);
+  const [paymentId, setPaymentId] = useState<string | null>(null);
+  const [qrCodeData, setQrCodeData] = useState<string | null>(null);
+  const [pixCode, setPixCode] = useState<string | null>(null);
+  const [isAdminView, setIsAdminView] = useState(false);
+  const [adminOrders, setAdminOrders] = useState<any[]>([]);
   
   const [checkoutStep, setCheckoutStep] = useState(1);
   const [paymentMethod, setPaymentMethod] = useState<'pix' | 'card'>('pix');
@@ -37,13 +73,193 @@ export default function App() {
 
   const handleFinishCheckout = (e: React.FormEvent) => {
     e.preventDefault();
-    showToast('Pedido processado com sucesso! Redirecionando...');
-    setTimeout(() => {
-      setIsCheckoutOpen(false);
-      setCart([]);
-      setCheckoutStep(1);
-    }, 2000);
+    if (paymentMethod === 'pix') {
+      setCheckoutStep(4); // Show QR Code and wait
+      processOrder();
+    } else {
+      processOrder();
+    }
   };
+
+  const processOrder = async () => {
+    const subtotal = cart.reduce((acc, item) => acc + (item.price * item.qty), 0);
+    const totalWithShipping = subtotal + SHIPPING_COST;
+    const finalTotal = paymentMethod === 'pix' ? (subtotal * 0.85) + SHIPPING_COST : totalWithShipping;
+    
+    const newOrder = {
+      id: Math.random().toString(36).substr(2, 9).toUpperCase(),
+      items: [...cart],
+      total: finalTotal,
+      date: new Date(),
+      status: 'Aguardando Pagamento'
+    };
+    setOrder(newOrder);
+    
+    if (paymentMethod === 'pix') {
+      setIsGeneratingQR(true);
+      try {
+        const response = await fetch('/api/payment/create', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ 
+            amount: finalTotal,
+            items: cart,
+            customer: checkoutData
+          })
+        });
+        const data = await response.json();
+        setPaymentId(data.paymentId);
+        setQrCodeData(data.qrCodeData);
+        setPixCode(data.pixCode);
+        setIsGeneratingQR(false);
+        setIsVerifyingPayment(true);
+      } catch (error) {
+        console.error('Error creating payment:', error);
+        showToast('Erro ao gerar pagamento. Tente novamente.');
+        setIsGeneratingQR(false);
+      }
+    } else {
+      // Stripe Checkout Integration
+      if (!stripePromise) {
+        showToast('Sistema de pagamento não configurado. Adicione as chaves do Stripe.');
+        return;
+      }
+
+      try {
+        const response = await fetch('/api/create-checkout-session', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            items: cart,
+            customer: checkoutData,
+            successUrl: `${window.location.origin}/?payment=success&orderId=${newOrder.id}`,
+            cancelUrl: `${window.location.origin}/?payment=cancel`,
+          }),
+        });
+
+        const session = await response.json();
+        if (session.error) throw new Error(session.error);
+
+        const stripe = (await stripePromise) as any;
+        if (stripe) {
+          const { error } = await stripe.redirectToCheckout({
+            sessionId: session.id,
+          });
+          if (error) throw error;
+        }
+      } catch (error: any) {
+        console.error('Stripe error:', error);
+        showToast(`Erro no pagamento: ${error.message}`);
+      }
+    }
+  };
+
+  // Handle Stripe Redirects
+  useEffect(() => {
+    const urlParams = new URLSearchParams(window.location.search);
+    const payment = urlParams.get('payment');
+    const orderId = urlParams.get('orderId');
+
+    if (payment === 'success' && orderId) {
+      showToast('Pagamento confirmado com sucesso!');
+      setCart([]);
+      setView('tracking');
+      // In a real app, you'd fetch the order details from the server here
+      setOrder({
+        id: orderId,
+        items: [], // You might want to store this in localStorage or fetch from DB
+        total: 0,
+        date: new Date(),
+        status: 'Pago'
+      });
+      // Clear URL params
+      window.history.replaceState({}, document.title, window.location.pathname);
+    } else if (payment === 'cancel') {
+      showToast('Pagamento cancelado.');
+      window.history.replaceState({}, document.title, window.location.pathname);
+    }
+  }, []);
+
+  // Polling for payment status
+  useEffect(() => {
+    let interval: any;
+    if (isVerifyingPayment && paymentId && checkoutStep === 4) {
+      interval = setInterval(async () => {
+        try {
+          const response = await fetch(`/api/payment/status/${paymentId}`);
+          const data = await response.json();
+          if (data.status === 'confirmed') {
+            clearInterval(interval);
+            setIsVerifyingPayment(false);
+            setCheckoutStep(5);
+            showToast('Pagamento confirmado pelo sistema!');
+            
+            setTimeout(() => {
+              setIsCheckoutOpen(false);
+              setCart([]);
+              setView('tracking');
+              setCheckoutStep(1);
+              setPaymentId(null);
+              setQrCodeData(null);
+            }, 4000);
+          }
+        } catch (error) {
+          console.error('Error checking payment status:', error);
+        }
+      }, 3000); // Check every 3 seconds
+    }
+    return () => clearInterval(interval);
+  }, [isVerifyingPayment, paymentId, checkoutStep]);
+
+  const notifyPayment = async () => {
+    if (!paymentId) return;
+    try {
+      const response = await fetch('/api/payment/notify', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ orderId: paymentId })
+      });
+      if (response.ok) {
+        showToast('Notificação enviada! Aguardando confirmação do lojista.');
+      }
+    } catch (error) {
+      console.error('Error notifying payment:', error);
+    }
+  };
+
+  const fetchAdminOrders = async () => {
+    try {
+      const response = await fetch('/api/admin/orders');
+      const data = await response.json();
+      setAdminOrders(data);
+    } catch (error) {
+      console.error('Error fetching admin orders:', error);
+    }
+  };
+
+  const confirmAdminPayment = async (orderId: string) => {
+    try {
+      const response = await fetch('/api/admin/confirm-payment', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ orderId })
+      });
+      if (response.ok) {
+        showToast('Pagamento confirmado com sucesso!');
+        fetchAdminOrders();
+      }
+    } catch (error) {
+      console.error('Error confirming payment:', error);
+    }
+  };
+
+  useEffect(() => {
+    if (isAdminView) {
+      fetchAdminOrders();
+      const interval = setInterval(fetchAdminOrders, 10000);
+      return () => clearInterval(interval);
+    }
+  }, [isAdminView]);
   
   const toggleCompare = (product: Product) => {
     setCompareList(prev => {
@@ -107,7 +323,8 @@ export default function App() {
     showToast('Carrinho limpo!');
   };
 
-  const cartTotal = useMemo(() => cart.reduce((acc, item) => acc + item.price * item.qty, 0), [cart]);
+  const cartSubtotal = useMemo(() => cart.reduce((acc, item) => acc + item.price * item.qty, 0), [cart]);
+  const cartTotal = useMemo(() => cartSubtotal + (cart.length > 0 ? SHIPPING_COST : 0), [cartSubtotal, cart.length]);
   const cartCount = useMemo(() => cart.reduce((acc, item) => acc + item.qty, 0), [cart]);
 
   const handleCarSearch = () => {
@@ -141,6 +358,122 @@ export default function App() {
     return PRODUCTS.filter(p => p.cat === activeFilter);
   }, [activeFilter]);
 
+  if (view === 'tracking' && order) {
+    return (
+      <div className="min-h-screen bg-[#f5f5f5] font-sans text-black">
+        <nav className="fixed top-0 left-0 right-0 bg-white/90 backdrop-blur-md z-[100] border-b border-border px-8 py-4 flex justify-between items-center shadow-sm">
+          <h1 className="text-2xl font-black tracking-tighter uppercase cursor-pointer" onClick={() => setView('shop')}>Pneu<span className="text-ac">Express</span></h1>
+          <button onClick={() => setView('shop')} className="text-[0.7rem] font-bold uppercase tracking-widest hover:text-ac transition-colors border border-border px-4 py-2 rounded-sm">Voltar para a Loja</button>
+        </nav>
+
+        <main className="pt-32 px-4 pb-20 max-w-4xl mx-auto">
+          <div className="bg-white rounded-sm shadow-xl border border-border overflow-hidden">
+            <div className="bg-ac p-8 md:p-12 text-black">
+              <div className="flex flex-col md:flex-row justify-between items-start gap-6">
+                <div>
+                  <p className="text-[0.65rem] font-bold uppercase tracking-[0.3em] opacity-70 mb-2">Pedido #{order.id}</p>
+                  <h2 className="font-display text-4xl tracking-wider leading-none">STATUS DO PEDIDO</h2>
+                </div>
+                <div className="md:text-right">
+                  <p className="text-[0.65rem] font-bold uppercase tracking-[0.3em] opacity-70 mb-2">Previsão de Entrega</p>
+                  <p className="font-display text-2xl tracking-wider">Até {new Date(order.date.getTime() + 48 * 60 * 60 * 1000).toLocaleDateString('pt-BR')}</p>
+                </div>
+              </div>
+            </div>
+
+            <div className="p-8 md:p-12 space-y-12">
+              {/* Progress Bar */}
+              <div className="relative flex justify-between">
+                <div className="absolute top-5 left-0 w-full h-[2px] bg-gray-100 z-0"></div>
+                <div className="absolute top-5 left-0 h-[2px] bg-green-500 z-0 transition-all duration-1000" style={{ width: '33%' }}></div>
+                
+                {[
+                  { icon: CheckCircle2, label: 'Pagamento', active: true },
+                  { icon: Smartphone, label: 'Preparação', active: true },
+                  { icon: Truck, label: 'Em Trânsito', active: false },
+                  { icon: ShoppingCart, label: 'Entregue', active: false }
+                ].map((step, i) => (
+                  <div key={i} className="relative z-10 flex flex-col items-center w-20">
+                    <div className={`w-10 h-10 rounded-full flex items-center justify-center border-4 border-white shadow-md transition-colors duration-500 ${step.active ? 'bg-green-500 text-white' : 'bg-gray-100 text-gray-400'}`}>
+                      <step.icon className="w-5 h-5" />
+                    </div>
+                    <p className={`text-[0.6rem] font-bold uppercase mt-3 tracking-widest text-center ${step.active ? 'text-black' : 'text-gray-400'}`}>{step.label}</p>
+                  </div>
+                ))}
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-12 pt-8">
+                <div className="space-y-6">
+                  <div className="flex items-start gap-4 p-6 bg-green-50 border border-green-100 rounded-sm">
+                    <div className="bg-green-500 p-2 rounded-full text-white shrink-0">
+                      <CheckCircle2 className="w-5 h-5" />
+                    </div>
+                    <div>
+                      <h4 className="font-bold text-green-800 text-[0.85rem] uppercase tracking-wider mb-1">Pagamento Confirmado</h4>
+                      <p className="text-[0.8rem] text-green-700 leading-relaxed">O sistema verificou o seu depósito PIX. Seu produto já saiu para a triagem e será entregue dentro do prazo estipulado.</p>
+                    </div>
+                  </div>
+
+                  <div className="space-y-4">
+                    <h3 className="font-display text-xl tracking-wider border-b border-border pb-2">ITENS</h3>
+                    {order.items.map(item => (
+                      <div key={item.cartId} className="flex justify-between items-center">
+                        <div className="flex gap-4 items-center">
+                          <div className="w-12 h-12 bg-gray-50 border border-border p-1 rounded-sm">
+                            <img src={item.image} className="w-full h-full object-contain" alt="" />
+                          </div>
+                          <div>
+                            <p className="text-[0.8rem] font-bold text-black">{item.brand} {item.size}</p>
+                            <p className="text-[0.65rem] text-gray-500 uppercase tracking-widest">{item.qty} unidade(s)</p>
+                          </div>
+                        </div>
+                        <span className="font-bold text-[0.85rem]">R$ {(item.price * item.qty).toLocaleString('pt-BR')}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="space-y-6">
+                  <div className="bg-gray-50 p-8 rounded-sm border border-border space-y-4">
+                    <h3 className="font-display text-xl tracking-wider border-b border-border pb-2">DETALHES</h3>
+                    <div className="space-y-3">
+                      <div className="flex justify-between text-[0.75rem]">
+                        <span className="text-gray-500 uppercase tracking-widest">Data do Pedido</span>
+                        <span className="font-medium">{order.date.toLocaleDateString('pt-BR')}</span>
+                      </div>
+                      <div className="flex justify-between text-[0.75rem]">
+                        <span className="text-gray-500 uppercase tracking-widest">Método</span>
+                        <span className="font-medium">PIX (15% OFF)</span>
+                      </div>
+                      <div className="flex justify-between text-[0.75rem]">
+                        <span className="text-gray-500 uppercase tracking-widest">Subtotal</span>
+                        <span className="font-medium">R$ {order.items.reduce((acc, item) => acc + item.price * item.qty, 0).toLocaleString('pt-BR')} {order.total < (order.items.reduce((acc, item) => acc + item.price * item.qty, 0) + SHIPPING_COST) && <span className="text-green-600 ml-1">(R$ {(order.items.reduce((acc, item) => acc + item.price * item.qty, 0) * 0.85).toLocaleString('pt-BR')})</span>}</span>
+                      </div>
+                      <div className="flex justify-between text-[0.75rem]">
+                        <span className="text-gray-500 uppercase tracking-widest">Frete</span>
+                        <span className="font-medium">R$ {SHIPPING_COST.toLocaleString('pt-BR')}</span>
+                      </div>
+                      <div className="flex justify-between text-[0.75rem] pt-4 border-t border-border">
+                        <span className="text-black font-bold uppercase tracking-widest">Total Pago</span>
+                        <span className="text-xl font-black text-ac">R$ {order.total.toLocaleString('pt-BR')}</span>
+                      </div>
+                    </div>
+                  </div>
+                  
+                  <div className="p-6 border border-dashed border-border rounded-sm">
+                    <p className="text-[0.7rem] text-gray-500 italic leading-relaxed">
+                      * O rastreamento detalhado será atualizado assim que a transportadora coletar o produto em nosso centro de distribuição.
+                    </p>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </main>
+      </div>
+    );
+  }
+
   return (
     <div className="font-sans">
       {/* Navigation */}
@@ -149,6 +482,12 @@ export default function App() {
           <a href="#inicio" className="font-display text-2xl tracking-wider text-black no-underline">
             PNEU <span className="text-ac">EXPRESS BR</span>
           </a>
+          {!import.meta.env.VITE_STRIPE_PUBLISHABLE_KEY && (
+            <div className="hidden lg:flex items-center gap-2 bg-red-50 text-red-600 px-3 py-1 rounded-full text-[0.65rem] font-bold border border-red-100">
+              <AlertCircle className="w-3 h-3" />
+              CONFIGURAÇÃO PENDENTE: ADICIONE AS CHAVES DO STRIPE
+            </div>
+          )}
           <motion.div 
             animate={{ 
               scale: [1, 1.15, 1],
@@ -461,7 +800,7 @@ export default function App() {
             <div className="space-y-4">
               <div className="flex items-center gap-4 text-[0.88rem] text-[#333]">
                 <Mail className="w-5 h-5 text-ac" />
-                <span>borrachariaexpressbr@gmail.com</span>
+                <span>pneu_expressbr@jim.com</span>
               </div>
               <div className="flex items-center gap-4 text-[0.88rem] text-[#333]">
                 <MapPin className="w-5 h-5 text-ac" />
@@ -526,10 +865,18 @@ export default function App() {
 
       <div className="bg-white border-t border-border px-6 md:px-12 py-5 flex flex-col md:flex-row justify-between items-center gap-3 text-center">
         <p className="text-[0.75rem] text-[#777]">© 2025 Pneu Express BR. Todos os direitos reservados.</p>
-        <p className="text-[0.75rem] text-[#777] flex items-center gap-1.5">
-          <ShieldCheck className="w-3.5 h-3.5 text-ac" />
-          Site sem rastreamento — seus dados são seus.
-        </p>
+        <div className="flex gap-4 items-center">
+          <p className="text-[0.75rem] text-[#777] flex items-center gap-1.5">
+            <ShieldCheck className="w-3.5 h-3.5 text-ac" />
+            Site sem rastreamento — seus dados são seus.
+          </p>
+          <button 
+            onClick={() => setIsAdminView(!isAdminView)}
+            className="text-[0.7rem] text-[#777] opacity-20 hover:opacity-100 transition-opacity uppercase tracking-widest font-bold"
+          >
+            Admin
+          </button>
+        </div>
       </div>
 
       {/* Quick View Modal */}
@@ -570,6 +917,21 @@ export default function App() {
                 <h2 className="font-display text-4xl tracking-wider mb-4 text-black">{selectedProduct.size}</h2>
                 
                 <div className="space-y-6 flex-1">
+                  <div className="flex gap-3">
+                    <div className="flex items-center gap-1.5 bg-[#f5f5f5] px-3 py-1.5 rounded-sm border border-border">
+                      <Fuel className={`w-4 h-4 ${getGradeColor(selectedProduct.fuel)}`} />
+                      <span className="text-[0.75rem] font-bold text-black">{selectedProduct.fuel}</span>
+                    </div>
+                    <div className="flex items-center gap-1.5 bg-[#f5f5f5] px-3 py-1.5 rounded-sm border border-border">
+                      <Droplets className={`w-4 h-4 ${getGradeColor(selectedProduct.rain)}`} />
+                      <span className="text-[0.75rem] font-bold text-black">{selectedProduct.rain}</span>
+                    </div>
+                    <div className="flex items-center gap-1.5 bg-[#f5f5f5] px-3 py-1.5 rounded-sm border border-border">
+                      <Volume2 className={`w-4 h-4 ${getNoiseColor(selectedProduct.noise)}`} />
+                      <span className="text-[0.75rem] font-bold text-black">{selectedProduct.noise}db</span>
+                    </div>
+                  </div>
+
                   <div>
                     <span className="text-[0.7rem] tracking-widest uppercase text-[#777] block mb-1">Linha / Modelo</span>
                     <p className="text-[0.95rem] font-semibold text-black">{selectedProduct.label}</p>
@@ -675,10 +1037,26 @@ export default function App() {
               </div>
 
               {cart.length > 0 && (
-                <div className="border-t border-border pt-6 mt-4 space-y-4">
-                  <div className="flex justify-between font-display text-2xl text-black">
+                <div className="border-t border-border pt-6 mt-4 space-y-3">
+                  <div className="flex justify-between text-[0.75rem] text-[#777] uppercase tracking-widest">
+                    <span>Subtotal</span>
+                    <div className="text-right">
+                      <span className="block">R$ {cartSubtotal.toLocaleString('pt-BR')}</span>
+                      <span className="block text-green-600 text-[0.65rem]">R$ {(cartSubtotal * 0.85).toLocaleString('pt-BR')} no PIX</span>
+                    </div>
+                  </div>
+                  <div className="flex justify-between text-[0.75rem] text-[#777] uppercase tracking-widest">
+                    <span>Frete</span>
+                    <div className="text-right">
+                      <span className="block">R$ {SHIPPING_COST.toLocaleString('pt-BR')}</span>
+                    </div>
+                  </div>
+                  <div className="flex justify-between font-display text-2xl text-black pt-2">
                     <span>TOTAL</span>
-                    <span>R$ {cartTotal.toLocaleString('pt-BR')}</span>
+                    <div className="text-right">
+                      <span className="block text-[0.8rem] text-[#777] line-through font-sans">R$ {cartTotal.toLocaleString('pt-BR')}</span>
+                      <span className="block">R$ {(cartSubtotal * 0.85 + SHIPPING_COST).toLocaleString('pt-BR')}</span>
+                    </div>
                   </div>
                   <button 
                     onClick={() => {
@@ -761,15 +1139,20 @@ export default function App() {
                 <div className="pt-6 border-t border-border mt-6">
                   <div className="flex justify-between items-center mb-2">
                     <span className="text-[0.75rem] text-[#777]">Subtotal</span>
-                    <span className="text-[0.85rem] font-semibold text-black">R$ {cartTotal.toLocaleString('pt-BR')}</span>
+                    <div className="text-right">
+                      <span className={`text-[0.85rem] font-semibold ${paymentMethod === 'pix' ? 'text-[#777] line-through text-[0.75rem]' : 'text-black'}`}>R$ {cartSubtotal.toLocaleString('pt-BR')}</span>
+                      {paymentMethod === 'pix' && <span className="block text-[0.85rem] font-bold text-green-600">R$ {(cartSubtotal * 0.85).toLocaleString('pt-BR')}</span>}
+                    </div>
                   </div>
                   <div className="flex justify-between items-center mb-4">
                     <span className="text-[0.75rem] text-[#777]">Frete</span>
-                    <span className="text-[0.75rem] text-green-600 font-bold">GRÁTIS</span>
+                    <div className="text-right">
+                      <span className="text-[0.75rem] font-bold text-black">R$ {SHIPPING_COST.toLocaleString('pt-BR')}</span>
+                    </div>
                   </div>
                   <div className="flex justify-between items-center pt-4 border-t border-border">
                     <span className="font-display text-lg text-black">TOTAL</span>
-                    <span className="font-display text-2xl text-ac">R$ {cartTotal.toLocaleString('pt-BR')}</span>
+                    <span className="font-display text-2xl text-ac">R$ {(paymentMethod === 'pix' ? (cartSubtotal * 0.85) + SHIPPING_COST : cartTotal).toLocaleString('pt-BR')}</span>
                   </div>
                 </div>
               </div>
@@ -782,6 +1165,10 @@ export default function App() {
                   <div className={`w-8 h-8 rounded-full flex items-center justify-center text-[0.75rem] font-bold ${checkoutStep >= 2 ? 'bg-ac text-black' : 'bg-border text-[#777]'}`}>2</div>
                   <div className="h-[1px] flex-1 bg-border"></div>
                   <div className={`w-8 h-8 rounded-full flex items-center justify-center text-[0.75rem] font-bold ${checkoutStep >= 3 ? 'bg-ac text-black' : 'bg-border text-[#777]'}`}>3</div>
+                  <div className="h-[1px] flex-1 bg-border"></div>
+                  <div className={`w-8 h-8 rounded-full flex items-center justify-center text-[0.75rem] font-bold ${checkoutStep >= 4 ? 'bg-ac text-black' : 'bg-border text-[#777]'}`}>4</div>
+                  <div className="h-[1px] flex-1 bg-border"></div>
+                  <div className={`w-8 h-8 rounded-full flex items-center justify-center text-[0.75rem] font-bold ${checkoutStep >= 5 ? 'bg-ac text-black' : 'bg-border text-[#777]'}`}>5</div>
                 </div>
 
                 <form onSubmit={handleFinishCheckout} className="space-y-6">
@@ -802,7 +1189,7 @@ export default function App() {
                           <input required type="email" name="email" value={checkoutData.email} onChange={handleCheckoutChange} className="w-full bg-white border border-border p-3 text-[0.85rem] focus:border-ac outline-none transition-colors" placeholder="joao@exemplo.com" />
                         </div>
                         <div className="space-y-1">
-                          <label className="text-[0.65rem] uppercase tracking-widest text-[#777]">Telefone / WhatsApp</label>
+                          <label className="text-[0.65rem] uppercase tracking-widest text-[#777]">Telefone</label>
                           <input required name="phone" value={checkoutData.phone} onChange={handleCheckoutChange} className="w-full bg-white border border-border p-3 text-[0.85rem] focus:border-ac outline-none transition-colors" placeholder="(11) 99999-9999" />
                         </div>
                       </div>
@@ -858,7 +1245,7 @@ export default function App() {
                         <button 
                           type="button"
                           onClick={() => setPaymentMethod('pix')}
-                          className={`p-4 border-2 flex flex-col items-center gap-2 transition-all ${paymentMethod === 'pix' ? 'border-ac bg-ac/5' : 'border-border'}`}
+                          className={`p-4 border-2 flex flex-col items-center gap-2 transition-all rounded-sm ${paymentMethod === 'pix' ? 'border-ac bg-ac/5' : 'border-border hover:border-[#ccc]'}`}
                         >
                           <Smartphone className="w-6 h-6" />
                           <span className="text-[0.75rem] font-bold uppercase tracking-widest">PIX (15% OFF)</span>
@@ -866,7 +1253,7 @@ export default function App() {
                         <button 
                           type="button"
                           onClick={() => setPaymentMethod('card')}
-                          className={`p-4 border-2 flex flex-col items-center gap-2 transition-all ${paymentMethod === 'card' ? 'border-ac bg-ac/5' : 'border-border'}`}
+                          className={`p-4 border-2 flex flex-col items-center gap-2 transition-all rounded-sm ${paymentMethod === 'card' ? 'border-ac bg-ac/5' : 'border-border hover:border-[#ccc]'}`}
                         >
                           <CreditCard className="w-6 h-6" />
                           <span className="text-[0.75rem] font-bold uppercase tracking-widest">Cartão</span>
@@ -874,52 +1261,249 @@ export default function App() {
                       </div>
 
                       {paymentMethod === 'pix' ? (
-                        <div className="bg-[#f9f9f9] p-6 text-center space-y-4 border border-dashed border-border">
-                          <div className="w-32 h-32 bg-white mx-auto border border-border flex items-center justify-center">
-                            <Smartphone className="w-12 h-12 text-[#ccc]" />
+                        <div className="bg-[#f9f9f9] p-8 text-center space-y-4 border border-dashed border-border rounded-sm">
+                          <div className="w-40 h-40 bg-white mx-auto border border-border flex items-center justify-center shadow-sm">
+                            <Smartphone className="w-16 h-16 text-[#ccc]" />
                           </div>
-                          <p className="text-[0.82rem] text-[#555]">O código PIX será gerado após a confirmação. Pague e receba aprovação instantânea.</p>
-                          <div className="text-ac font-bold text-xl">R$ {(cartTotal * 0.85).toLocaleString('pt-BR')}</div>
+                          <div className="space-y-2">
+                            <p className="text-[0.82rem] text-[#555] font-medium">O código PIX será gerado após a confirmação.</p>
+                            <p className="text-[0.72rem] text-[#777]">Pague e receba aprovação instantânea para agilizar sua entrega.</p>
+                          </div>
+                          <div className="text-ac font-black text-2xl tracking-tighter">R$ {(cartTotal * 0.85).toLocaleString('pt-BR')}</div>
                         </div>
                       ) : (
-                        <div className="space-y-4">
-                          <div className="flex gap-4 p-1 bg-[#f5f5f5] rounded-sm">
-                            <button type="button" onClick={() => setCardType('credit')} className={`flex-1 py-2 text-[0.65rem] font-bold uppercase tracking-widest transition-all ${cardType === 'credit' ? 'bg-white shadow-sm text-black' : 'text-[#777]'}`}>Crédito</button>
-                            <button type="button" onClick={() => setCardType('debit')} className={`flex-1 py-2 text-[0.65rem] font-bold uppercase tracking-widest transition-all ${cardType === 'debit' ? 'bg-white shadow-sm text-black' : 'text-[#777]'}`}>Débito</button>
+                        <div className="space-y-6 animate-in fade-in slide-in-from-bottom-2 duration-300">
+                          <div className="flex gap-4 p-1 bg-[#f5f5f5] rounded-sm border border-border">
+                            <button 
+                              type="button" 
+                              onClick={() => setCardType('credit')} 
+                              className={`flex-1 py-3 text-[0.65rem] font-bold uppercase tracking-widest transition-all rounded-sm ${cardType === 'credit' ? 'bg-white shadow-sm text-black' : 'text-[#777] hover:text-[#444]'}`}
+                            >
+                              Crédito
+                            </button>
+                            <button 
+                              type="button" 
+                              onClick={() => setCardType('debit')} 
+                              className={`flex-1 py-3 text-[0.65rem] font-bold uppercase tracking-widest transition-all rounded-sm ${cardType === 'debit' ? 'bg-white shadow-sm text-black' : 'text-[#777] hover:text-[#444]'}`}
+                            >
+                              Débito
+                            </button>
                           </div>
+                          
                           <div className="space-y-4">
                             <div className="space-y-1">
-                              <label className="text-[0.65rem] uppercase tracking-widest text-[#777]">Número do Cartão</label>
-                              <input required name="cardNumber" value={checkoutData.cardNumber} onChange={handleCheckoutChange} className="w-full bg-white border border-border p-3 text-[0.85rem] focus:border-ac outline-none transition-colors" placeholder="0000 0000 0000 0000" />
+                              <label className="text-[0.65rem] uppercase tracking-widest text-[#777] font-bold">Número do Cartão</label>
+                              <div className="relative">
+                                <input required name="cardNumber" value={checkoutData.cardNumber} onChange={handleCheckoutChange} className="w-full bg-white border border-border p-4 text-[0.85rem] focus:border-ac outline-none transition-colors rounded-sm pr-12" placeholder="0000 0000 0000 0000" />
+                                <CreditCard className="absolute right-4 top-1/2 -translate-y-1/2 w-5 h-5 text-[#ccc]" />
+                              </div>
                             </div>
                             <div className="space-y-1">
-                              <label className="text-[0.65rem] uppercase tracking-widest text-[#777]">Nome no Cartão</label>
-                              <input required name="cardName" value={checkoutData.cardName} onChange={handleCheckoutChange} className="w-full bg-white border border-border p-3 text-[0.85rem] focus:border-ac outline-none transition-colors" placeholder="COMO ESTÁ NO CARTÃO" />
+                              <label className="text-[0.65rem] uppercase tracking-widest text-[#777] font-bold">Nome no Cartão</label>
+                              <input required name="cardName" value={checkoutData.cardName} onChange={handleCheckoutChange} className="w-full bg-white border border-border p-4 text-[0.85rem] focus:border-ac outline-none transition-colors rounded-sm" placeholder="COMO ESTÁ NO CARTÃO" />
                             </div>
                             <div className="grid grid-cols-2 gap-4">
                               <div className="space-y-1">
-                                <label className="text-[0.65rem] uppercase tracking-widest text-[#777]">Validade</label>
-                                <input required name="cardExpiry" value={checkoutData.cardExpiry} onChange={handleCheckoutChange} className="w-full bg-white border border-border p-3 text-[0.85rem] focus:border-ac outline-none transition-colors" placeholder="MM/AA" />
+                                <label className="text-[0.65rem] uppercase tracking-widest text-[#777] font-bold">Validade</label>
+                                <input required name="cardExpiry" value={checkoutData.cardExpiry} onChange={handleCheckoutChange} className="w-full bg-white border border-border p-4 text-[0.85rem] focus:border-ac outline-none transition-colors rounded-sm" placeholder="MM/AA" />
                               </div>
                               <div className="space-y-1">
-                                <label className="text-[0.65rem] uppercase tracking-widest text-[#777]">CVV</label>
-                                <input required name="cardCvv" value={checkoutData.cardCvv} onChange={handleCheckoutChange} className="w-full bg-white border border-border p-3 text-[0.85rem] focus:border-ac outline-none transition-colors" placeholder="123" />
+                                <label className="text-[0.65rem] uppercase tracking-widest text-[#777] font-bold">CVV</label>
+                                <input required name="cardCvv" value={checkoutData.cardCvv} onChange={handleCheckoutChange} className="w-full bg-white border border-border p-4 text-[0.85rem] focus:border-ac outline-none transition-colors rounded-sm" placeholder="123" />
                               </div>
                             </div>
+                            {cardType === 'credit' && (
+                              <div className="space-y-1">
+                                <label className="text-[0.65rem] uppercase tracking-widest text-[#777] font-bold">Parcelamento</label>
+                                <select className="w-full bg-white border border-border p-4 text-[0.85rem] focus:border-ac outline-none transition-colors rounded-sm appearance-none cursor-pointer">
+                                  <option>1x de R$ {cartTotal.toLocaleString('pt-BR')} sem juros</option>
+                                  <option>2x de R$ {(cartTotal/2).toLocaleString('pt-BR')} sem juros</option>
+                                  <option>3x de R$ {(cartTotal/3).toLocaleString('pt-BR')} sem juros</option>
+                                  <option>6x de R$ {(cartTotal/6).toLocaleString('pt-BR')} sem juros</option>
+                                  <option>10x de R$ {(cartTotal/10).toLocaleString('pt-BR')} sem juros</option>
+                                  <option>12x de R$ {(cartTotal/12).toLocaleString('pt-BR')} sem juros</option>
+                                </select>
+                              </div>
+                            )}
                           </div>
                         </div>
                       )}
 
                       <div className="flex gap-4 mt-8">
-                        <button type="button" onClick={() => setCheckoutStep(2)} className="flex-1 border border-border text-[#777] py-4 font-semibold text-[0.75rem] tracking-widest uppercase hover:bg-[#f5f5f5] transition-colors">Voltar</button>
-                        <button type="submit" className="flex-[2] bg-ac text-black py-4 font-semibold text-[0.85rem] tracking-widest uppercase hover:bg-ac2 transition-colors">Finalizar Compra</button>
+                        <button type="button" onClick={() => setCheckoutStep(2)} className="flex-1 border border-border text-[#777] py-4 font-semibold text-[0.75rem] tracking-widest uppercase hover:bg-[#f5f5f5] transition-colors rounded-sm">Voltar</button>
+                        <button type="submit" className="flex-[2] bg-ac text-black py-4 font-semibold text-[0.85rem] tracking-widest uppercase hover:bg-ac2 transition-colors rounded-sm shadow-lg">Finalizar Compra</button>
                       </div>
+                    </motion.div>
+                  )}
+
+                  {checkoutStep === 4 && (
+                    <motion.div initial={{ opacity: 0, scale: 0.9 }} animate={{ opacity: 1, scale: 1 }} className="text-center space-y-6 py-6">
+                      <div className="space-y-2">
+                        <h4 className="font-display text-2xl tracking-wider text-black uppercase">Aguardando Pagamento</h4>
+                        <p className="text-[0.85rem] text-[#777]">Escaneie o QR Code ou copie o código abaixo.</p>
+                      </div>
+                      
+                      <div className="flex flex-col md:flex-row items-center justify-center gap-8">
+                        <div className="relative w-48 h-48 bg-white border-4 border-ac p-3 shadow-xl shrink-0">
+                          <div className="w-full h-full bg-[#f5f5f5] flex items-center justify-center">
+                            {isGeneratingQR ? (
+                              <div className="flex flex-col items-center gap-3">
+                                <div className="w-8 h-8 border-2 border-ac border-t-transparent rounded-full animate-spin"></div>
+                                <p className="text-[0.65rem] font-bold uppercase tracking-widest text-[#777]">Gerando...</p>
+                              </div>
+                            ) : (
+                              <img 
+                                src={`https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(qrCodeData || 'PneuExpressBR_Payment')}`} 
+                                alt="QR Code PIX" 
+                                className="w-full h-full" 
+                              />
+                            )}
+                          </div>
+                        </div>
+
+                        <div className="flex-1 max-w-xs space-y-4 text-left">
+                          <div className="space-y-1">
+                            <label className="text-[0.65rem] uppercase tracking-widest text-[#777] font-bold">PIX Copia e Cola</label>
+                            <div className="flex gap-2">
+                              <input 
+                                readOnly 
+                                value={pixCode || 'Gerando código...'} 
+                                className="flex-1 bg-gray-50 border border-border p-3 text-[0.7rem] font-mono truncate outline-none rounded-sm"
+                              />
+                              <button 
+                                type="button"
+                                onClick={() => {
+                                  if (pixCode) {
+                                    navigator.clipboard.writeText(pixCode);
+                                    showToast('Código PIX copiado!');
+                                  }
+                                }}
+                                className="bg-black text-white px-4 py-2 rounded-sm hover:bg-[#333] transition-colors"
+                              >
+                                <Smartphone className="w-4 h-4" />
+                              </button>
+                            </div>
+                          </div>
+                          <div className="bg-green-50 p-3 border border-green-100 rounded-sm">
+                            <p className="text-[0.65rem] text-green-700 font-medium leading-relaxed">
+                              <CheckCircle2 className="w-3 h-3 inline mr-1" />
+                              Pagamento instantâneo com 15% de desconto aplicado.
+                            </p>
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="space-y-4 pt-4">
+                        <div className="bg-gray-50 p-4 rounded-sm border border-border inline-block">
+                          <p className="text-[0.65rem] uppercase tracking-widest text-[#777] mb-1">Valor Total</p>
+                          <p className="text-2xl font-black text-black">R$ {(cartTotal * 0.85).toLocaleString('pt-BR')}</p>
+                        </div>
+                        <div className="flex items-center justify-center gap-2 text-[0.7rem] text-ac font-bold animate-pulse">
+                          <div className="w-2 h-2 bg-ac rounded-full"></div>
+                          SISTEMA MONITORANDO PAGAMENTO...
+                        </div>
+                        <button 
+                          type="button"
+                          onClick={notifyPayment}
+                          className="w-full bg-black text-white py-4 font-bold text-[0.75rem] tracking-widest uppercase hover:bg-[#333] transition-colors rounded-sm"
+                        >
+                          Já realizei o pagamento
+                        </button>
+                      </div>
+                    </motion.div>
+                  )}
+
+                  {checkoutStep === 5 && (
+                    <motion.div initial={{ opacity: 0, scale: 0.9 }} animate={{ opacity: 1, scale: 1 }} className="text-center space-y-6 py-12">
+                      <div className="w-20 h-20 bg-green-500 rounded-full flex items-center justify-center mx-auto shadow-lg shadow-green-200">
+                        <CheckCircle2 className="w-10 h-10 text-white" />
+                      </div>
+                      <div className="space-y-2">
+                        <h4 className="font-display text-3xl tracking-wider text-black uppercase">Pagamento Confirmado!</h4>
+                        <p className="text-[0.9rem] text-[#555]">O sistema identificou seu depósito com sucesso.</p>
+                      </div>
+                      <p className="text-[0.8rem] text-[#777] max-w-sm mx-auto">Seu pedido já foi encaminhado para a triagem. Você será redirecionado para a página de acompanhamento em instantes.</p>
                     </motion.div>
                   )}
                 </form>
               </div>
             </motion.div>
           </>
+        )}
+      </AnimatePresence>
+
+      {/* Admin Modal */}
+      <AnimatePresence>
+        {isAdminView && (
+          <motion.div 
+            initial={{ opacity: 0 }} 
+            animate={{ opacity: 1 }} 
+            exit={{ opacity: 0 }} 
+            className="fixed inset-0 bg-black/90 z-[1000] overflow-y-auto p-4 md:p-12"
+          >
+            <div className="max-w-5xl mx-auto bg-white rounded-sm overflow-hidden shadow-2xl">
+              <div className="bg-ac p-6 flex justify-between items-center">
+                <h2 className="font-display text-2xl tracking-widest uppercase text-black">Painel de Pedidos</h2>
+                <button onClick={() => setIsAdminView(false)} className="text-black hover:scale-110 transition-transform">
+                  <X className="w-8 h-8" />
+                </button>
+              </div>
+              <div className="p-8">
+                {adminOrders.length === 0 ? (
+                  <div className="text-center py-20 text-[#777]">Nenhum pedido encontrado.</div>
+                ) : (
+                  <div className="space-y-6">
+                    {adminOrders.map((order) => (
+                      <div key={order.id} className="border border-border p-6 rounded-sm hover:border-ac transition-colors">
+                        <div className="flex flex-col md:flex-row justify-between gap-4 mb-4">
+                          <div>
+                            <p className="text-[0.65rem] uppercase tracking-widest text-[#777] font-bold">Pedido #{order.id}</p>
+                            <p className="text-lg font-black text-black">R$ {order.amount.toLocaleString('pt-BR')}</p>
+                            <p className="text-[0.75rem] text-[#555]">{new Date(order.date).toLocaleString('pt-BR')}</p>
+                          </div>
+                          <div className="flex items-center gap-3">
+                            <span className={`px-3 py-1 text-[0.6rem] font-bold uppercase tracking-widest rounded-full ${
+                              order.status === 'confirmed' ? 'bg-green-100 text-green-700' : 
+                              order.status === 'processing' ? 'bg-yellow-100 text-yellow-700' : 
+                              'bg-gray-100 text-gray-700'
+                            }`}>
+                              {order.status === 'confirmed' ? 'Confirmado' : 
+                               order.status === 'processing' ? 'Aguardando Conferência' : 
+                               'Pendente'}
+                            </span>
+                            {order.status !== 'confirmed' && (
+                              <button 
+                                onClick={() => confirmAdminPayment(order.id)}
+                                className="bg-ac text-black px-4 py-2 text-[0.65rem] font-bold uppercase tracking-widest hover:bg-ac2 transition-colors rounded-sm"
+                              >
+                                Confirmar Pagamento
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                        <div className="border-t border-border pt-4">
+                          <p className="text-[0.65rem] uppercase tracking-widest text-[#777] font-bold mb-2">Cliente</p>
+                          <p className="text-[0.85rem] font-medium">{order.customer?.name} ({order.customer?.email})</p>
+                          <p className="text-[0.85rem] text-[#555]">{order.customer?.address}, {order.customer?.city} - {order.customer?.zip}</p>
+                        </div>
+                        <div className="mt-4">
+                          <p className="text-[0.65rem] uppercase tracking-widest text-[#777] font-bold mb-2">Itens</p>
+                          <div className="space-y-1">
+                            {order.items.map((item: any, idx: number) => (
+                              <div key={idx} className="text-[0.8rem] flex justify-between">
+                                <span>{item.qty}x {item.brand} {item.size}</span>
+                                <span className="font-bold">R$ {(item.price * item.qty).toLocaleString('pt-BR')}</span>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+          </motion.div>
         )}
       </AnimatePresence>
 
@@ -946,16 +1530,16 @@ function ProductCard({ product, onAdd, onQuickView, onCompare, isComparing }: an
       {/* Energy Labels */}
       <div className="absolute top-4 left-4 z-10 flex flex-col gap-1.5 pointer-events-none">
         <div className="flex items-center gap-1 bg-[#f5f5f5] px-1.5 py-0.5 rounded-sm border border-border">
-          <Fuel className="w-3 h-3 text-yellow-600" />
-          <span className="text-[0.65rem] font-bold text-black">E</span>
+          <Fuel className={`w-3 h-3 ${getGradeColor(product.fuel)}`} />
+          <span className="text-[0.65rem] font-bold text-black">{product.fuel}</span>
         </div>
         <div className="flex items-center gap-1 bg-[#f5f5f5] px-1.5 py-0.5 rounded-sm border border-border">
-          <Droplets className="w-3 h-3 text-blue-600" />
-          <span className="text-[0.65rem] font-bold text-black">C</span>
+          <Droplets className={`w-3 h-3 ${getGradeColor(product.rain)}`} />
+          <span className="text-[0.65rem] font-bold text-black">{product.rain}</span>
         </div>
         <div className="flex items-center gap-1 bg-[#f5f5f5] px-1.5 py-0.5 rounded-sm border border-border">
-          <Volume2 className="w-3 h-3 text-green-600" />
-          <span className="text-[0.65rem] font-bold text-black">72db</span>
+          <Volume2 className={`w-3 h-3 ${getNoiseColor(product.noise)}`} />
+          <span className="text-[0.65rem] font-bold text-black">{product.noise}db</span>
         </div>
       </div>
 
